@@ -11,6 +11,7 @@ function rand(min: number, max: number) {
 function makeVehicle(i: number): LiveVehicle {
   const lat = BASE_LAT + rand(-0.03, 0.03);
   const lon = BASE_LON + rand(-0.03, 0.03);
+
   return {
     id: `V${i}`,
     name: `Vehicle ${String(i).padStart(2, "0")}`,
@@ -20,6 +21,7 @@ function makeVehicle(i: number): LiveVehicle {
     heading: Math.floor(rand(0, 360)),
     status: "moving",
     lastUpdate: Date.now(),
+    distanceKm: 0,
   };
 }
 
@@ -41,18 +43,26 @@ export function startMockLiveStream(count = 25) {
       const stoppedChance = 0.10;
 
       let status: LiveVehicle["status"] = v.status;
+
       if (Math.random() < offlineChance) status = "offline";
       else if (Math.random() < stoppedChance) status = "stopped";
       else status = "moving";
 
       const speed =
-        status === "moving" ? Math.floor(rand(20, 95)) : status === "stopped" ? 0 : 0;
+        status === "moving"
+          ? Math.floor(rand(20, 95))
+          : status === "stopped"
+          ? 0
+          : 0;
 
       // Very small movement per tick
       const step = status === "moving" ? rand(0.00015, 0.00055) : 0;
-      const heading = status === "moving" ? (v.heading + rand(-15, 15) + 360) % 360 : v.heading;
+      const heading =
+        status === "moving"
+          ? (v.heading + rand(-15, 15) + 360) % 360
+          : v.heading;
 
-      // Convert heading to dx/dy approx (not perfect geo, good enough for demo)
+      // Convert heading to dx/dy approx, good enough for demo
       const rad = (heading * Math.PI) / 180;
       const dLat = step * Math.cos(rad);
       const dLon = step * Math.sin(rad);
@@ -65,6 +75,7 @@ export function startMockLiveStream(count = 25) {
         speedKph: speed,
         status,
         lastUpdate: now,
+        distanceKm: v.distanceKm ?? 0,
       });
     }
   }, 1000);
