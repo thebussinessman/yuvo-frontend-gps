@@ -83,3 +83,14 @@ L.marker([-15.3875, 28.3228])
   .addTo(map)
   .bindPopup('Vehicle A001');
 
+const { ValidationPipe } = require('@nestjs/common');
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // add this line alongside your existing setup
+  app.useGlobalPipes(new ValidationPipe({ whitelist: true }));
+
+  await app.listen(3000);
+}
+bootstrap();

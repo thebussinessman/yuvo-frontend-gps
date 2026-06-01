@@ -3,8 +3,8 @@ import { liveVehiclesStore } from "../../store/liveVehicles";
 
 export function useLiveVehicles() {
   return useSyncExternalStore(
-    (cb) => liveVehiclesStore.subscribe(cb),
-    () => liveVehiclesStore.getAll(),
-    () => liveVehiclesStore.getAll()
+    liveVehiclesStore.subscribe,
+    liveVehiclesStore.getSnapshot,
+    liveVehiclesStore.getSnapshot
   );
 }
