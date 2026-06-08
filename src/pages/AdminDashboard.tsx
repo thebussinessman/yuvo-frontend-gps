@@ -52,7 +52,8 @@ import type { LiveVehicle } from '../store/liveVehicles';
  *   GET /api/playback?imei=<imei>&from=<ISO>&to=<ISO>
  *
  * Vite .env:
- *   VITE_API_URL=http://localhost:3000
+ *   Local: VITE_API_URL=http://localhost:3000
+ *   Railway: VITE_API_URL=https://yuvo-gps-production.up.railway.app
  */
 
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://localhost:3000';
@@ -910,7 +911,7 @@ export default function AdminDashboard() {
               </div>
               <div className="flex items-center gap-2 text-xs text-slate-500">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                API :3000
+                API : Railway
               </div>
             </div>
 
