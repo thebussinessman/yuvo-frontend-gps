@@ -71,6 +71,13 @@ export default function LiveMap({ selectedId, onVehicleClick }: LiveMapProps = {
     })),
   }), [vehicles]);
 
+  // Always-current ref to the latest geojson, so the map "load" handler below
+  // (captured once, on mount) can read whatever data has arrived by the time
+  // it actually fires, instead of being stuck with an empty snapshot from
+  // when the effect closure was first created.
+  const geojsonRef = useRef(geojson);
+  useEffect(() => { geojsonRef.current = geojson; }, [geojson]);
+
   // Init map once
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -99,7 +106,10 @@ export default function LiveMap({ selectedId, onVehicleClick }: LiveMapProps = {
           }),
         );
 
-        map.addSource("vehicles", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+        // Seed with whatever vehicle data has already arrived (e.g. from the
+        // initial REST snapshot) instead of starting empty and waiting for
+        // the next live update before anything shows on the map.
+        map.addSource("vehicles", { type: "geojson", data: geojsonRef.current });
 
         // Selection ring — behind the icon
         map.addLayer({
