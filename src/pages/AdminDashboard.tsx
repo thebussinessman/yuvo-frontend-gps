@@ -672,6 +672,7 @@ function PlaybackPage({ fleet }: { fleet: FleetPosition[] }) {
 
 interface VehicleReport {
   imei: string;
+  name?: string;
   pointCount: number;
   distanceKm: number;
   maxSpeedKph: number;
@@ -698,9 +699,9 @@ function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: num
   return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
-function summarizeRoute(imei: string, points: LatestPosition[]): VehicleReport {
+function summarizeRoute(imei: string, points: LatestPosition[], name?: string): VehicleReport {
   if (points.length === 0) {
-    return { imei, pointCount: 0, distanceKm: 0, maxSpeedKph: 0, movingMinutes: 0, idleMinutes: 0, noDataMinutes: 0 };
+    return { imei, name, pointCount: 0, distanceKm: 0, maxSpeedKph: 0, movingMinutes: 0, idleMinutes: 0, noDataMinutes: 0 };
   }
 
   let distanceKm = 0;
@@ -727,7 +728,7 @@ function summarizeRoute(imei: string, points: LatestPosition[]): VehicleReport {
     }
   }
 
-  return { imei, pointCount: points.length, distanceKm, maxSpeedKph, movingMinutes, idleMinutes, noDataMinutes };
+  return { imei, name, pointCount: points.length, distanceKm, maxSpeedKph, movingMinutes, idleMinutes, noDataMinutes };
 }
 
 function formatHours(minutes: number): string {
@@ -735,9 +736,10 @@ function formatHours(minutes: number): string {
 }
 
 function downloadReportCsv(reports: VehicleReport[], from: string, to: string) {
-  const header = 'IMEI,Distance (km),Max speed (km/h),Moving (hrs),Idle (hrs),No data (hrs),GPS points\n';
+  const header = 'IMEI,Name,Distance (km),Max speed (km/h),Moving (hrs),Idle (hrs),No data (hrs),GPS points\n';
   const rows = reports.map(r => [
     r.imei,
+    `"${(r.name ?? '').replace(/"/g, '""')}"`,
     r.distanceKm.toFixed(1),
     r.maxSpeedKph.toFixed(0),
     formatHours(r.movingMinutes),
@@ -757,6 +759,10 @@ function downloadReportCsv(reports: VehicleReport[], from: string, to: string) {
 // ─── Page: Reports ────────────────────────────────────────────────────────────
 
 function ReportsPage({ fleet }: { fleet: FleetPosition[] }) {
+  const liveVehicles = useLiveVehicles();
+  const nameByImei = useMemo(() => new Map(liveVehicles.map(v => [v.id, v.name])), [liveVehicles]);
+
+  const [selectedImei, setSelectedImei] = useState('');
   const [from, setFrom] = useState(() => {
     const d = new Date(); d.setDate(d.getDate() - 7);
     return d.toISOString().slice(0, 16);
@@ -767,20 +773,22 @@ function ReportsPage({ fleet }: { fleet: FleetPosition[] }) {
   const [reportError, setReportError] = useState<string | null>(null);
 
   const runReport = async () => {
-    if (fleet.length === 0) return;
+    const targets = selectedImei ? fleet.filter(v => v.imei === selectedImei) : fleet;
+    if (targets.length === 0) return;
     setLoadingReport(true);
     setReportError(null);
     try {
       const fromIso = new Date(from).toISOString();
       const toIso = new Date(to).toISOString();
       const results = await Promise.all(
-        fleet.map(async (v): Promise<VehicleReport> => {
+        targets.map(async (v): Promise<VehicleReport> => {
+          const name = nameByImei.get(v.imei);
           try {
             const points = await getPlayback(v.imei, fromIso, toIso);
-            return summarizeRoute(v.imei, points);
+            return summarizeRoute(v.imei, points, name);
           } catch {
             return {
-              imei: v.imei, pointCount: 0, distanceKm: 0, maxSpeedKph: 0,
+              imei: v.imei, name, pointCount: 0, distanceKm: 0, maxSpeedKph: 0,
               movingMinutes: 0, idleMinutes: 0, noDataMinutes: 0, failed: true,
             };
           }
@@ -826,8 +834,23 @@ function ReportsPage({ fleet }: { fleet: FleetPosition[] }) {
 
       {reportError && <SectionError message={reportError} />}
 
-      <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+      <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6 space-y-5">
         <div className="grid gap-4 sm:grid-cols-3">
+          <div>
+            <label className="mb-1 block text-xs text-slate-400">Vehicle</label>
+            <select
+              value={selectedImei}
+              onChange={e => setSelectedImei(e.target.value)}
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none"
+            >
+              <option value="">All vehicles</option>
+              {fleet.map(v => (
+                <option key={v.imei} value={v.imei}>
+                  {nameByImei.get(v.imei) ? `${nameByImei.get(v.imei)} — ${v.imei}` : v.imei}
+                </option>
+              ))}
+            </select>
+          </div>
           <div>
             <label className="mb-1 block text-xs text-slate-400">From</label>
             <input
@@ -846,17 +869,15 @@ function ReportsPage({ fleet }: { fleet: FleetPosition[] }) {
               className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none"
             />
           </div>
-          <div className="flex items-end">
-            <button
-              type="button"
-              onClick={() => void runReport()}
-              disabled={loadingReport || fleet.length === 0}
-              className="flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-500 px-5 py-2 text-sm font-semibold text-slate-950 disabled:opacity-60"
-            >
-              {loadingReport ? 'Generating…' : 'Generate Report'}
-            </button>
-          </div>
         </div>
+        <button
+          type="button"
+          onClick={() => void runReport()}
+          disabled={loadingReport || fleet.length === 0}
+          className="flex items-center gap-2 rounded-lg bg-cyan-500 px-5 py-2 text-sm font-semibold text-slate-950 disabled:opacity-60"
+        >
+          <PlayCircle size={16} />{loadingReport ? 'Generating…' : 'Generate Report'}
+        </button>
       </div>
 
       {totals && (
@@ -872,7 +893,7 @@ function ReportsPage({ fleet }: { fleet: FleetPosition[] }) {
         <div className="border-b border-slate-800 p-5">
           <h3 className="text-base font-semibold text-white">Per-vehicle summary</h3>
           <p className="text-sm text-slate-400">
-            {reports ? `${from.replace('T', ' ')} → ${to.replace('T', ' ')}` : 'Choose a date range and generate a report.'}
+            {reports ? `${from.replace('T', ' ')} → ${to.replace('T', ' ')}` : 'Choose a vehicle and date range, then generate a report.'}
           </p>
         </div>
         {!reports ? (
@@ -884,7 +905,7 @@ function ReportsPage({ fleet }: { fleet: FleetPosition[] }) {
             <table className="min-w-full text-left text-sm">
               <thead className="bg-slate-950/60 text-slate-400">
                 <tr>
-                  <th className="px-5 py-4">IMEI</th>
+                  <th className="px-5 py-4">Vehicle</th>
                   <th className="px-5 py-4">Distance</th>
                   <th className="px-5 py-4">Max speed</th>
                   <th className="px-5 py-4">Moving</th>
@@ -896,7 +917,10 @@ function ReportsPage({ fleet }: { fleet: FleetPosition[] }) {
               <tbody>
                 {reports.map(r => (
                   <tr key={r.imei} className="border-t border-slate-800">
-                    <td className="px-5 py-4 font-medium text-white">{r.imei}</td>
+                    <td className="px-5 py-4 font-medium text-white">
+                      {r.name || r.imei}
+                      {r.name && <div className="font-mono text-xs text-slate-500">{r.imei}</div>}
+                    </td>
                     {r.failed ? (
                       <td className="px-5 py-4 text-red-300" colSpan={6}>Failed to load this vehicle&apos;s history.</td>
                     ) : (
