@@ -279,7 +279,7 @@ export default function PlaybackMap({ points, currentIndex }: PlaybackMapProps) 
     moveCar(points, currentIndex, !isNewRoute);
     prevPointsRef.current = points;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [points, currentIndex]);ss
+  }, [points, currentIndex]);
 
   return <div ref={containerRef} className="h-full w-full" />;
 }
