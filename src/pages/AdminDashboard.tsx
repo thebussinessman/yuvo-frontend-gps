@@ -39,6 +39,7 @@ import UsersPage from './UsersPage';
 import LiveMap from '../features/map/LiveMap';
 import { useLiveVehicles } from '../shared/hooks/useLiveVehicles';
 import type { LiveVehicle } from '../store/liveVehicles';
+import PlaybackMap from './PlaybackPage';
 
 /**
  * YUVO GPS — Full Admin Dashboard
@@ -164,25 +165,6 @@ function StatCard({
         <div className={`rounded-xl p-3 ${accent}`}>
           <Icon size={22} />
         </div>
-      </div>
-    </div>
-  );
-}
-
-function MapPlaceholder({ label, sub }: { label: string; sub?: string }) {
-  return (
-    <div className="relative flex h-full min-h-[320px] items-center justify-center overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
-      <div className="absolute inset-0 opacity-10"
-        style={{
-          backgroundImage:
-            'linear-gradient(#22d3ee 1px,transparent 1px),linear-gradient(90deg,#22d3ee 1px,transparent 1px)',
-          backgroundSize: '30px 30px',
-        }}
-      />
-      <div className="z-10 text-center">
-        <MapPin className="mx-auto mb-3 text-cyan-400" size={40} />
-        <p className="font-medium text-white">{label}</p>
-        {sub && <p className="mt-1 text-sm text-slate-400">{sub}</p>}
       </div>
     </div>
   );
