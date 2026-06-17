@@ -679,7 +679,9 @@ function PlaybackPage({ fleet }: { fleet: FleetPosition[] }) {
           </div>
         )}
       </div>
-      <MapPlaceholder label="Playback map" sub="Insert your PlaybackMap component here." />
+     <div className="h-[420px] overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
+  <PlaybackMap points={points} currentIndex={idx} />
+</div>
     </div>
   );
 }
