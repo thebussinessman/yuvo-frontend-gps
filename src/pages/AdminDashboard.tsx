@@ -668,63 +668,278 @@ function PlaybackPage({ fleet }: { fleet: FleetPosition[] }) {
   );
 }
 
+// ─── Historical report helpers ─────────────────────────────────────────────────
+
+interface VehicleReport {
+  imei: string;
+  pointCount: number;
+  distanceKm: number;
+  maxSpeedKph: number;
+  movingMinutes: number;
+  idleMinutes: number;
+  noDataMinutes: number;
+  failed?: boolean;
+}
+
+// Gaps longer than this are treated as the tracker having no signal (engine
+// off with no backup power, dead zone, SIM issue) rather than the vehicle
+// sitting idle the whole time — otherwise a car parked for 3 days with the
+// tracker unplugged would misleadingly show as "72 hours idle".
+const REPORT_GAP_MINUTES = 30;
+
+function haversineKm(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+  const R = 6371;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function summarizeRoute(imei: string, points: LatestPosition[]): VehicleReport {
+  if (points.length === 0) {
+    return { imei, pointCount: 0, distanceKm: 0, maxSpeedKph: 0, movingMinutes: 0, idleMinutes: 0, noDataMinutes: 0 };
+  }
+
+  let distanceKm = 0;
+  let maxSpeedKph = points[0].speed_kph;
+  let movingMinutes = 0;
+  let idleMinutes = 0;
+  let noDataMinutes = 0;
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const cur = points[i];
+    const next = points[i + 1];
+    maxSpeedKph = Math.max(maxSpeedKph, next.speed_kph);
+    distanceKm += haversineKm(cur, next);
+
+    const dtMinutes = (new Date(next.time).getTime() - new Date(cur.time).getTime()) / 60_000;
+    if (!Number.isFinite(dtMinutes) || dtMinutes <= 0) continue;
+
+    if (dtMinutes > REPORT_GAP_MINUTES) {
+      noDataMinutes += dtMinutes;
+    } else if (cur.speed_kph > MOVING_SPEED_KPH) {
+      movingMinutes += dtMinutes;
+    } else {
+      idleMinutes += dtMinutes;
+    }
+  }
+
+  return { imei, pointCount: points.length, distanceKm, maxSpeedKph, movingMinutes, idleMinutes, noDataMinutes };
+}
+
+function formatHours(minutes: number): string {
+  return (minutes / 60).toFixed(1);
+}
+
+function downloadReportCsv(reports: VehicleReport[], from: string, to: string) {
+  const header = 'IMEI,Distance (km),Max speed (km/h),Moving (hrs),Idle (hrs),No data (hrs),GPS points\n';
+  const rows = reports.map(r => [
+    r.imei,
+    r.distanceKm.toFixed(1),
+    r.maxSpeedKph.toFixed(0),
+    formatHours(r.movingMinutes),
+    formatHours(r.idleMinutes),
+    formatHours(r.noDataMinutes),
+    r.pointCount,
+  ].join(','));
+  const blob = new Blob([header + rows.join('\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `yuvo-fleet-report_${from}_to_${to}.csv`.replace(/[: ]/g, '-');
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 // ─── Page: Reports ────────────────────────────────────────────────────────────
 
 function ReportsPage({ fleet }: { fleet: FleetPosition[] }) {
-  const topSpeeds = [...fleet].sort((a, b) => b.speed_kph - a.speed_kph).slice(0, 5);
-  const maxSpeed = Math.max(...topSpeeds.map(v => v.speed_kph), 1);
+  const [from, setFrom] = useState(() => {
+    const d = new Date(); d.setDate(d.getDate() - 7);
+    return d.toISOString().slice(0, 16);
+  });
+  const [to, setTo] = useState(() => new Date().toISOString().slice(0, 16));
+  const [reports, setReports] = useState<VehicleReport[] | null>(null);
+  const [loadingReport, setLoadingReport] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
+
+  const runReport = async () => {
+    if (fleet.length === 0) return;
+    setLoadingReport(true);
+    setReportError(null);
+    try {
+      const fromIso = new Date(from).toISOString();
+      const toIso = new Date(to).toISOString();
+      const results = await Promise.all(
+        fleet.map(async (v): Promise<VehicleReport> => {
+          try {
+            const points = await getPlayback(v.imei, fromIso, toIso);
+            return summarizeRoute(v.imei, points);
+          } catch {
+            return {
+              imei: v.imei, pointCount: 0, distanceKm: 0, maxSpeedKph: 0,
+              movingMinutes: 0, idleMinutes: 0, noDataMinutes: 0, failed: true,
+            };
+          }
+        }),
+      );
+      setReports(results);
+    } catch (e) {
+      setReportError(e instanceof Error ? e.message : 'Failed to generate report.');
+    } finally {
+      setLoadingReport(false);
+    }
+  };
+
+  const totals = useMemo(() => {
+    if (!reports || reports.length === 0) return null;
+    return reports.reduce(
+      (acc, r) => ({
+        distanceKm: acc.distanceKm + r.distanceKm,
+        movingMinutes: acc.movingMinutes + r.movingMinutes,
+        idleMinutes: acc.idleMinutes + r.idleMinutes,
+        maxSpeedKph: Math.max(acc.maxSpeedKph, r.maxSpeedKph),
+      }),
+      { distanceKm: 0, movingMinutes: 0, idleMinutes: 0, maxSpeedKph: 0 },
+    );
+  }, [reports]);
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-semibold text-white">Reports</h2>
-          <p className="mt-1 text-sm text-slate-400">Fleet analytics</p>
+          <p className="mt-1 text-sm text-slate-400">Historical distance, speed, and idle time per vehicle</p>
         </div>
-        <button type="button" className="flex items-center gap-2 rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950">
+        <button
+          type="button"
+          onClick={() => reports && downloadReportCsv(reports, from, to)}
+          disabled={!reports}
+          className="flex items-center gap-2 rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 disabled:opacity-40"
+        >
           <FileText size={15} /> Export CSV
         </button>
       </div>
-      <div className="grid gap-6 xl:grid-cols-2">
-        <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
-          <h3 className="mb-4 text-base font-semibold text-white">Top speeds</h3>
-          <div className="space-y-3">
-            {topSpeeds.map(v => (
-              <div key={v.imei} className="flex items-center gap-3">
-                <span className="w-28 truncate font-mono text-xs text-slate-400">{v.imei.slice(-8)}</span>
-                <div className="flex-1 h-2 rounded-full bg-slate-700 overflow-hidden">
-                  <div className="h-full rounded-full bg-cyan-500" style={{ width: `${(v.speed_kph / maxSpeed) * 100}%` }} />
-                </div>
-                <span className="w-16 text-right text-xs text-slate-300">{v.speed_kph.toFixed(0)} km/h</span>
-              </div>
-            ))}
-            {topSpeeds.length === 0 && <p className="text-sm text-slate-400">No data.</p>}
+
+      {reportError && <SectionError message={reportError} />}
+
+      <div className="rounded-2xl border border-slate-800 bg-slate-900 p-6">
+        <div className="grid gap-4 sm:grid-cols-3">
+          <div>
+            <label className="mb-1 block text-xs text-slate-400">From</label>
+            <input
+              type="datetime-local"
+              value={from}
+              onChange={e => setFrom(e.target.value)}
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none"
+            />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs text-slate-400">To</label>
+            <input
+              type="datetime-local"
+              value={to}
+              onChange={e => setTo(e.target.value)}
+              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white outline-none"
+            />
+          </div>
+          <div className="flex items-end">
+            <button
+              type="button"
+              onClick={() => void runReport()}
+              disabled={loadingReport || fleet.length === 0}
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-500 px-5 py-2 text-sm font-semibold text-slate-950 disabled:opacity-60"
+            >
+              {loadingReport ? 'Generating…' : 'Generate Report'}
+            </button>
           </div>
         </div>
-        <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
-          <h3 className="mb-4 text-base font-semibold text-white">Status breakdown</h3>
-          <div className="h-[220px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie
-                  data={[
-                    { name: 'Moving', value: fleet.filter(v => v.status === 'moving').length, fill: '#06b6d4' },
-                    { name: 'Parked', value: fleet.filter(v => v.status === 'parked').length, fill: '#f59e0b' },
-                    { name: 'Offline', value: fleet.filter(v => v.status === 'offline').length, fill: '#ef4444' },
-                  ]}
-                  dataKey="value"
-                  nameKey="name"
-                  innerRadius={50}
-                  outerRadius={76}
-                  paddingAngle={4}
-                >
-                  {['#06b6d4','#f59e0b','#ef4444'].map(fill => <Cell key={fill} fill={fill} />)}
-                </Pie>
-                <Tooltip contentStyle={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, color: '#e2e8f0' }} />
-                <Legend />
-              </PieChart>
-            </ResponsiveContainer>
+      </div>
+
+      {totals && (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <StatCard title="Total Distance (km)" value={Math.round(totals.distanceKm)} icon={Route} accent="bg-cyan-500/15 text-cyan-300" />
+          <StatCard title="Fastest Recorded (km/h)" value={Math.round(totals.maxSpeedKph)} icon={Gauge} accent="bg-indigo-500/15 text-indigo-300" />
+          <StatCard title="Total Moving (hrs)" value={Math.round(totals.movingMinutes / 60)} icon={Navigation} accent="bg-emerald-500/15 text-emerald-300" />
+          <StatCard title="Total Idle (hrs)" value={Math.round(totals.idleMinutes / 60)} icon={Clock3} accent="bg-amber-500/15 text-amber-300" />
+        </div>
+      )}
+
+      <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
+        <div className="border-b border-slate-800 p-5">
+          <h3 className="text-base font-semibold text-white">Per-vehicle summary</h3>
+          <p className="text-sm text-slate-400">
+            {reports ? `${from.replace('T', ' ')} → ${to.replace('T', ' ')}` : 'Choose a date range and generate a report.'}
+          </p>
+        </div>
+        {!reports ? (
+          <p className="p-10 text-center text-slate-400">
+            {loadingReport ? 'Generating report…' : 'No report generated yet.'}
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="min-w-full text-left text-sm">
+              <thead className="bg-slate-950/60 text-slate-400">
+                <tr>
+                  <th className="px-5 py-4">IMEI</th>
+                  <th className="px-5 py-4">Distance</th>
+                  <th className="px-5 py-4">Max speed</th>
+                  <th className="px-5 py-4">Moving</th>
+                  <th className="px-5 py-4">Idle</th>
+                  <th className="px-5 py-4">No data</th>
+                  <th className="px-5 py-4">Points</th>
+                </tr>
+              </thead>
+              <tbody>
+                {reports.map(r => (
+                  <tr key={r.imei} className="border-t border-slate-800">
+                    <td className="px-5 py-4 font-medium text-white">{r.imei}</td>
+                    {r.failed ? (
+                      <td className="px-5 py-4 text-red-300" colSpan={6}>Failed to load this vehicle&apos;s history.</td>
+                    ) : (
+                      <>
+                        <td className="px-5 py-4 text-slate-300">{r.distanceKm.toFixed(1)} km</td>
+                        <td className="px-5 py-4 text-slate-300">{r.maxSpeedKph.toFixed(0)} km/h</td>
+                        <td className="px-5 py-4 text-slate-300">{formatHours(r.movingMinutes)} hrs</td>
+                        <td className="px-5 py-4 text-slate-300">{formatHours(r.idleMinutes)} hrs</td>
+                        <td className="px-5 py-4 text-slate-500">{formatHours(r.noDataMinutes)} hrs</td>
+                        <td className="px-5 py-4 text-slate-500">{r.pointCount}</td>
+                      </>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
+        )}
+      </div>
+
+      <div className="rounded-2xl border border-slate-800 bg-slate-900 p-5">
+        <h3 className="mb-4 text-base font-semibold text-white">Current fleet status</h3>
+        <div className="h-[220px]">
+          <ResponsiveContainer width="100%" height="100%">
+            <PieChart>
+              <Pie
+                data={[
+                  { name: 'Moving', value: fleet.filter(v => v.status === 'moving').length, fill: '#06b6d4' },
+                  { name: 'Parked', value: fleet.filter(v => v.status === 'parked').length, fill: '#f59e0b' },
+                  { name: 'Offline', value: fleet.filter(v => v.status === 'offline').length, fill: '#ef4444' },
+                ]}
+                dataKey="value"
+                nameKey="name"
+                innerRadius={50}
+                outerRadius={76}
+                paddingAngle={4}
+              >
+                {['#06b6d4','#f59e0b','#ef4444'].map(fill => <Cell key={fill} fill={fill} />)}
+              </Pie>
+              <Tooltip contentStyle={{ background: '#1e293b', border: '1px solid #334155', borderRadius: 8, color: '#e2e8f0' }} />
+              <Legend />
+            </PieChart>
+          </ResponsiveContainer>
         </div>
       </div>
     </div>
