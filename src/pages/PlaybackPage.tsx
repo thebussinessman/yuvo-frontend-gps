@@ -1,32 +1,21 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import maplibregl, { type GeoJSONSource, type Map as MapLibreMap } from "maplibre-gl";
 import type { Feature, FeatureCollection, LineString, Point } from "geojson";
 
 const KEY = import.meta.env.VITE_MAPTILER_KEY;
 const STYLE_URL = `https://api.maptiler.com/maps/openstreetmap/style.json?key=${KEY}`;
-const API_BASE_URL = import.meta.env.VITE_API_URL || "http://localhost:3000";
+const LUSAKA_CENTER: [number, number] = [28.2833, -15.4167];
 
-// ─── Types ──────────────────────────────────────────────────────────────────
-
-type PlaybackPoint = {
-  imei: string;
-  time: string;
-  lat: number;
-  lon: number;
-  speed_kph: number;
-  course: number;
-  satellites?: number;
-};
-
-// ─── Car icon (sky accent, matching the app shell) ───────────────────────────
-
+// ─── Car icon SVG factory ──────────────────────────────────────────────────
+// Same shape as the one used on the live map. Points north (0°); MapLibre
+// rotates it by the `heading` property to match direction of travel.
 function makeCarImage(color: string): Promise<HTMLImageElement> {
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="38" height="38" viewBox="0 0 38 38">
     <circle cx="19" cy="19" r="17" fill="${color}" fill-opacity="0.18" stroke="${color}" stroke-width="1"/>
-    <rect x="13" y="16" width="12" height="13" rx="3" fill="${color}" stroke="#0a0c10" stroke-width="1.5"/>
-    <path d="M13 20 L19 9 L25 20 Z" fill="${color}" stroke="#0a0c10" stroke-width="1.5" stroke-linejoin="round"/>
-    <rect x="11" y="20" width="3" height="5" rx="1.5" fill="#0a0c10" opacity="0.85"/>
-    <rect x="24" y="20" width="3" height="5" rx="1.5" fill="#0a0c10" opacity="0.85"/>
+    <rect x="13" y="16" width="12" height="13" rx="3" fill="${color}" stroke="#0f172a" stroke-width="1.5"/>
+    <path d="M13 20 L19 9 L25 20 Z" fill="${color}" stroke="#0f172a" stroke-width="1.5" stroke-linejoin="round"/>
+    <rect x="11" y="20" width="3" height="5" rx="1.5" fill="#0f172a" opacity="0.85"/>
+    <rect x="24" y="20" width="3" height="5" rx="1.5" fill="#0f172a" opacity="0.85"/>
     <rect x="15" y="20" width="8" height="5" rx="1" fill="white" fill-opacity="0.25"/>
   </svg>`;
   return new Promise((resolve, reject) => {
@@ -37,355 +26,260 @@ function makeCarImage(color: string): Promise<HTMLImageElement> {
   });
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Types ──────────────────────────────────────────────────────────────────
 
-function bearing(lat1: number, lon1: number, lat2: number, lon2: number): number {
+export interface PlaybackPoint {
+  imei: string;
+  time: string;
+  lat: number;
+  lon: number;
+  speed_kph: number;
+  course: number;
+  satellites?: number;
+}
+
+interface PlaybackMapProps {
+  points: PlaybackPoint[];
+  currentIndex: number;
+}
+
+type LonLat = { lon: number; lat: number; heading: number };
+
+// ─── Small math helpers ────────────────────────────────────────────────────
+
+function bearing(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
   const toRad = (d: number) => (d * Math.PI) / 180;
   const toDeg = (r: number) => (r * 180) / Math.PI;
-  const phi1 = toRad(lat1);
-  const phi2 = toRad(lat2);
-  const dLambda = toRad(lon2 - lon1);
-  const y = Math.sin(dLambda) * Math.cos(phi2);
-  const x = Math.cos(phi1) * Math.sin(phi2) - Math.sin(phi1) * Math.cos(phi2) * Math.cos(dLambda);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const dLon = toRad(b.lon - a.lon);
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
   return (toDeg(Math.atan2(y, x)) + 360) % 360;
 }
 
-function toDatetimeLocal(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
 }
 
-// ─── Component ────────────────────────────────────────────────────────────
+// Shortest-path angle interpolation so the car icon doesn't spin the long
+// way around when the heading crosses the 0°/360° boundary.
+function lerpAngle(a: number, b: number, t: number): number {
+  const diff = ((b - a + 540) % 360) - 180;
+  return a + diff * t;
+}
 
-export default function PlaybackPage() {
+function lineFeature(coords: [number, number][]): Feature<LineString> {
+  return { type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: coords } };
+}
+
+function carFeatureCollection(lon: number, lat: number, heading: number): FeatureCollection<Point> {
+  return {
+    type: "FeatureCollection",
+    features: [
+      {
+        type: "Feature",
+        properties: { heading },
+        geometry: { type: "Point", coordinates: [lon, lat] },
+      },
+    ],
+  };
+}
+
+// ─── Component ──────────────────────────────────────────────────────────────
+
+export default function PlaybackMap({ points, currentIndex }: PlaybackMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
-  const mapLoadedRef = useRef(false);
+  const readyRef = useRef(false);
 
-  const [devices, setDevices] = useState<string[]>([]);
-  const [imei, setImei] = useState("");
-  const [from, setFrom] = useState(() => toDatetimeLocal(new Date(Date.now() - 24 * 60 * 60 * 1000)));
-  const [to, setTo] = useState(() => toDatetimeLocal(new Date()));
-
-  const [points, setPoints] = useState<PlaybackPoint[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const [playIndex, setPlayIndex] = useState(0);
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [speedMultiplier, setSpeedMultiplier] = useState(20);
-
-  const rafRef = useRef<number | null>(null);
-
-  // ── Load the device list once, so the dropdown isn't empty ──
+  // Always-current refs so the map "load" handler (captured once, on mount)
+  // can see whatever props have arrived by the time it actually fires.
+  const pointsRef = useRef(points);
   useEffect(() => {
-    fetch(`${API_BASE_URL}/api/latest`)
-      .then((r) => (r.ok ? r.json() : []))
-      .then((rows: { imei: string }[]) => {
-        const ids = rows.map((r) => r.imei);
-        setDevices(ids);
-        setImei((current) => current || ids[0] || "");
-      })
-      .catch(() => {});
-  }, []);
+    pointsRef.current = points;
+  }, [points]);
+  const indexRef = useRef(currentIndex);
+  useEffect(() => {
+    indexRef.current = currentIndex;
+  }, [currentIndex]);
 
-  // ── Map init, once ──
+  // Tracks the car's last drawn position so we can animate smoothly to the
+  // next one, and which `points` array we last drew a route for so we only
+  // re-fit the map / reset the trail when a genuinely new route is loaded.
+  const prevPosRef = useRef<LonLat | null>(null);
+  const prevPointsRef = useRef<PlaybackPoint[] | null>(null);
+  const animRef = useRef<number | null>(null);
+
+  function drawRoute(pts: PlaybackPoint[]) {
+    const map = mapRef.current;
+    const src = map?.getSource("route-full") as GeoJSONSource | undefined;
+    if (!map || !readyRef.current || !src) return;
+
+    const coords: [number, number][] = pts.map((p) => [p.lon, p.lat]);
+    src.setData(lineFeature(coords));
+
+    if (coords.length > 1) {
+      const bounds = coords.reduce(
+        (b, c) => b.extend(c),
+        new maplibregl.LngLatBounds(coords[0], coords[0]),
+      );
+      map.fitBounds(bounds, { padding: 60, maxZoom: 16, duration: 600 });
+    } else if (coords.length === 1) {
+      map.flyTo({ center: coords[0], zoom: 15, duration: 600 });
+    }
+  }
+
+  function setTraveled(pts: PlaybackPoint[], idx: number) {
+    const map = mapRef.current;
+    const src = map?.getSource("route-traveled") as GeoJSONSource | undefined;
+    if (!map || !readyRef.current || !src) return;
+    const coords: [number, number][] = pts.slice(0, idx + 1).map((p) => [p.lon, p.lat]);
+    src.setData(lineFeature(coords));
+  }
+
+  function setCarPosition(lon: number, lat: number, heading: number) {
+    const map = mapRef.current;
+    const src = map?.getSource("car") as GeoJSONSource | undefined;
+    if (!map || !readyRef.current || !src) return;
+    src.setData(carFeatureCollection(lon, lat, heading));
+  }
+
+  function moveCar(pts: PlaybackPoint[], idx: number, animate: boolean) {
+    const cur = pts[idx];
+    if (!mapRef.current || !readyRef.current || !cur) return;
+
+    const fallbackHeading = prevPosRef.current
+      ? bearing(prevPosRef.current, cur)
+      : 0;
+    const targetHeading = cur.course ?? fallbackHeading;
+
+    const from = prevPosRef.current;
+    if (animRef.current !== null) {
+      cancelAnimationFrame(animRef.current);
+      animRef.current = null;
+    }
+
+    if (!animate || !from) {
+      setCarPosition(cur.lon, cur.lat, targetHeading);
+      prevPosRef.current = { lon: cur.lon, lat: cur.lat, heading: targetHeading };
+      return;
+    }
+
+    const duration = 450;
+    const start = performance.now();
+
+    const step = (now: number) => {
+      const t = Math.min(1, (now - start) / duration);
+      setCarPosition(
+        lerp(from.lon, cur.lon, t),
+        lerp(from.lat, cur.lat, t),
+        lerpAngle(from.heading, targetHeading, t),
+      );
+      if (t < 1) {
+        animRef.current = requestAnimationFrame(step);
+      } else {
+        prevPosRef.current = { lon: cur.lon, lat: cur.lat, heading: targetHeading };
+        animRef.current = null;
+      }
+    };
+    animRef.current = requestAnimationFrame(step);
+  }
+
+  // Init map once.
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
     const map = new maplibregl.Map({
       container: containerRef.current,
       style: STYLE_URL,
-      center: [28.2833, -15.4167],
-      zoom: 11.5,
+      center: LUSAKA_CENTER,
+      zoom: 12,
     });
+
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
 
     map.on("load", () => {
       void (async () => {
-        const img = await makeCarImage("#38bdf8");
-        map.addImage("car-playback", img);
+        const img = await makeCarImage("#22d3ee");
+        map.addImage("playback-car", img);
 
-        map.addSource("route", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-        map.addLayer({
-          id: "route-line",
-          type: "line",
-          source: "route",
-          paint: { "line-color": "#38bdf8", "line-width": 3, "line-opacity": 0.6 },
+        map.addSource("route-full", {
+          type: "geojson",
+          data: lineFeature([]),
+        });
+        map.addSource("route-traveled", {
+          type: "geojson",
+          data: lineFeature([]),
+        });
+        map.addSource("car", {
+          type: "geojson",
+          data: { type: "FeatureCollection", features: [] },
         });
 
-        map.addSource("car", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+        map.addLayer({
+          id: "route-full-line",
+          type: "line",
+          source: "route-full",
+          paint: { "line-color": "#334155", "line-width": 3 },
+        });
+        map.addLayer({
+          id: "route-traveled-line",
+          type: "line",
+          source: "route-traveled",
+          paint: { "line-color": "#22d3ee", "line-width": 3.5 },
+        });
         map.addLayer({
           id: "car-icon",
           type: "symbol",
           source: "car",
           layout: {
-            "icon-image": "car-playback",
+            "icon-image": "playback-car",
             "icon-size": 1,
             "icon-rotate": ["get", "heading"],
             "icon-rotation-alignment": "map",
             "icon-pitch-alignment": "map",
             "icon-allow-overlap": true,
+            "icon-ignore-placement": true,
           },
         });
 
-        mapLoadedRef.current = true;
+        readyRef.current = true;
+
+        // Catch up with whatever props arrived before "load" fired.
+        drawRoute(pointsRef.current);
+        setTraveled(pointsRef.current, indexRef.current);
+        moveCar(pointsRef.current, indexRef.current, false);
+        prevPointsRef.current = pointsRef.current;
       })();
     });
 
     mapRef.current = map;
     return () => {
+      if (animRef.current !== null) cancelAnimationFrame(animRef.current);
       map.remove();
       mapRef.current = null;
+      readyRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── Fetch playback history for the selected device + range ──
-  async function loadPlayback() {
-    if (!imei) {
-      setError("Choose a device first.");
-      return;
-    }
-    setLoading(true);
-    setError(null);
-    setIsPlaying(false);
-    setPlayIndex(0);
-
-    try {
-      const params = new URLSearchParams({
-        imei,
-        from: new Date(from).toISOString(),
-        to: new Date(to).toISOString(),
-      });
-      const res = await fetch(`${API_BASE_URL}/api/playback?${params.toString()}`);
-      if (!res.ok) throw new Error(`The server returned an error (HTTP ${res.status}).`);
-      const data: PlaybackPoint[] = await res.json();
-      setPoints(data);
-      if (data.length === 0) {
-        setError("No positions were recorded for this device in that time range.");
-      }
-    } catch (e) {
-      setPoints([]);
-      setError(e instanceof Error ? e.message : "Couldn't load playback data.");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  // ── Draw the trail + fit the map whenever a new route loads ──
+  // Whenever points or the scrub index change: if it's a brand-new route
+  // (a different array than last time, e.g. from clicking "Load Route"),
+  // redraw the full trail and snap the car to the start with no animation.
+  // Otherwise it's just a step/scrub within the same route, so animate the
+  // car smoothly to its new position.
   useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapLoadedRef.current) return;
-    const src = map.getSource("route") as GeoJSONSource | undefined;
-    if (!src) return;
-
-    const features: Feature<LineString>[] =
-      points.length > 1
-        ? [
-            {
-              type: "Feature",
-              properties: {},
-              geometry: { type: "LineString", coordinates: points.map((p) => [p.lon, p.lat]) },
-            },
-          ]
-        : [];
-    src.setData({ type: "FeatureCollection", features } as FeatureCollection<LineString>);
-
-    if (points.length) {
-      const bounds = points.reduce(
-        (b, p) => b.extend([p.lon, p.lat]),
-        new maplibregl.LngLatBounds([points[0].lon, points[0].lat], [points[0].lon, points[0].lat]),
-      );
-      map.fitBounds(bounds, { padding: 60, maxZoom: 16, duration: 600 });
+    const isNewRoute = prevPointsRef.current !== points;
+    if (isNewRoute) {
+      prevPosRef.current = null;
+      drawRoute(points);
     }
-  }, [points]);
-
-  // ── Interpolate a smooth position + heading between the two surrounding points ──
-  const interpolated = useMemo(() => {
-    if (points.length === 0) return null;
-    if (points.length === 1) {
-      return { lat: points[0].lat, lon: points[0].lon, heading: points[0].course, point: points[0] };
-    }
-    const clamped = Math.max(0, Math.min(points.length - 1, playIndex));
-    const i0 = Math.floor(clamped);
-    const i1 = Math.min(points.length - 1, i0 + 1);
-    const t = clamped - i0;
-    const p0 = points[i0];
-    const p1 = points[i1];
-    const lat = p0.lat + (p1.lat - p0.lat) * t;
-    const lon = p0.lon + (p1.lon - p0.lon) * t;
-    const heading = p0.lat !== p1.lat || p0.lon !== p1.lon ? bearing(p0.lat, p0.lon, p1.lat, p1.lon) : p0.course;
-    return { lat, lon, heading, point: p0 };
-  }, [points, playIndex]);
-
-  // ── Move the car icon to the interpolated position ──
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || !mapLoadedRef.current) return;
-    const src = map.getSource("car") as GeoJSONSource | undefined;
-    if (!src) return;
-
-    if (!interpolated) {
-      src.setData({ type: "FeatureCollection", features: [] });
-      return;
-    }
-    const feature: Feature<Point> = {
-      type: "Feature",
-      properties: { heading: interpolated.heading },
-      geometry: { type: "Point", coordinates: [interpolated.lon, interpolated.lat] },
-    };
-    src.setData({ type: "FeatureCollection", features: [feature] });
-  }, [interpolated]);
-
-  // ── Animation loop: advance through real recorded time gaps, scaled by speed ──
-  useEffect(() => {
-    if (!isPlaying || points.length < 2) return;
-
-    let cancelled = false;
-    let lastFrameTime = performance.now();
-    let currentIndex = playIndex;
-
-    function frame(now: number) {
-      if (cancelled) return;
-      const dtMs = now - lastFrameTime;
-      lastFrameTime = now;
-
-      const i0 = Math.floor(currentIndex);
-      if (i0 >= points.length - 1) {
-        setIsPlaying(false);
-        return;
-      }
-      const i1 = i0 + 1;
-      const segmentDurationMs = Math.max(
-        200,
-        new Date(points[i1].time).getTime() - new Date(points[i0].time).getTime(),
-      );
-      currentIndex += (dtMs * speedMultiplier) / segmentDurationMs;
-
-      if (currentIndex >= points.length - 1) {
-        setPlayIndex(points.length - 1);
-        setIsPlaying(false);
-        return;
-      }
-      setPlayIndex(currentIndex);
-      rafRef.current = requestAnimationFrame(frame);
-    }
-
-    rafRef.current = requestAnimationFrame(frame);
-    return () => {
-      cancelled = true;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    };
+    setTraveled(points, currentIndex);
+    moveCar(points, currentIndex, !isNewRoute);
+    prevPointsRef.current = points;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isPlaying, points, speedMultiplier]);
+  }, [points, currentIndex]);
 
-  const currentTimeLabel = interpolated ? new Date(interpolated.point.time).toLocaleString() : null;
-  const canPlay = points.length >= 2;
-
-  return (
-    <div className="flex h-full min-h-[600px] w-full flex-col bg-[#0a0c10]">
-      {/* Controls: device + time range */}
-      <div className="flex flex-wrap items-end gap-3 border-b border-[#1a1f2e] bg-[#0a0c10] p-3">
-        <label className="flex flex-col text-[11px] uppercase tracking-wide text-slate-500">
-          Device
-          <select
-            value={imei}
-            onChange={(e) => setImei(e.target.value)}
-            className="mt-1 rounded border border-slate-800 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
-          >
-            {devices.length === 0 && <option value="">No devices yet</option>}
-            {devices.map((id) => (
-              <option key={id} value={id}>
-                {id}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        <label className="flex flex-col text-[11px] uppercase tracking-wide text-slate-500">
-          From
-          <input
-            type="datetime-local"
-            value={from}
-            onChange={(e) => setFrom(e.target.value)}
-            className="mt-1 rounded border border-slate-800 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
-          />
-        </label>
-
-        <label className="flex flex-col text-[11px] uppercase tracking-wide text-slate-500">
-          To
-          <input
-            type="datetime-local"
-            value={to}
-            onChange={(e) => setTo(e.target.value)}
-            className="mt-1 rounded border border-slate-800 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
-          />
-        </label>
-
-        <button
-          onClick={loadPlayback}
-          disabled={loading || !imei}
-          className="rounded bg-sky-500 px-4 py-1.5 text-xs font-medium text-[#0a0c10] transition hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {loading ? "Loading…" : "Load route"}
-        </button>
-
-        {currentTimeLabel && (
-          <span className="ml-auto font-mono text-xs text-slate-500">
-            {currentTimeLabel}
-            {interpolated && ` · ${interpolated.point.speed_kph.toFixed(0)} km/h`}
-          </span>
-        )}
-      </div>
-
-      {error && (
-        <div className="border-b border-[#1a1f2e] bg-[#0a0c10] px-3 py-2 text-xs text-amber-400">{error}</div>
-      )}
-
-      {/* Map */}
-      <div ref={containerRef} className="flex-1" />
-
-      {/* Playback transport controls */}
-      <div className="flex items-center gap-3 border-t border-[#1a1f2e] bg-[#0a0c10] p-3">
-        <button
-          onClick={() => setIsPlaying((p) => !p)}
-          disabled={!canPlay}
-          className="rounded border border-slate-800 bg-slate-900 px-4 py-1.5 text-xs font-medium text-slate-100 transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          {isPlaying ? "Pause" : "Play"}
-        </button>
-
-        <input
-          type="range"
-          min={0}
-          max={Math.max(0, points.length - 1)}
-          step={0.01}
-          value={playIndex}
-          onChange={(e) => {
-            setIsPlaying(false);
-            setPlayIndex(Number(e.target.value));
-          }}
-          disabled={!canPlay}
-          className="flex-1 accent-sky-500 disabled:opacity-40"
-          aria-label="Playback position"
-        />
-
-        <label className="flex items-center gap-2 text-[11px] uppercase tracking-wide text-slate-500">
-          Speed
-          <select
-            value={speedMultiplier}
-            onChange={(e) => setSpeedMultiplier(Number(e.target.value))}
-            className="rounded border border-slate-800 bg-slate-900 px-2 py-1 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
-          >
-            <option value={1}>1×</option>
-            <option value={10}>10×</option>
-            <option value={20}>20×</option>
-            <option value={60}>60×</option>
-            <option value={300}>300×</option>
-          </select>
-        </label>
-      </div>
-    </div>
-  );
+  return <div ref={containerRef} className="h-full w-full" />;
 }
